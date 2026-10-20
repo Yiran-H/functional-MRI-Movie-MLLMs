@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.pyc
+.vscode/
+# large raw data / intermediates kept local
+movie/
+embedding/old/
+fmri_*.npy
+fmri_*.npz
+human_vs_model_results/**/*.npz
+# results / data outputs are not versioned
+*.npy
+*.npz
+*.png
+*.pdf
+*.csv
+*.srt
+embedding/
+human_vs_model_results/
+rating_benchmark/results/
+ROI-wise correlation comparison between model and human rating across subjects/
+Tom and valence across three different movies across subjects/
+# age-group analyses kept local
+*age*
+task1_*
+task2_*
+merge_task2_*
+plot_combined_roi*

@@ -12,6 +12,7 @@ import copy
 import time
 import csv
 import argparse
+import pandas as pd
 import torch
 from PIL import Image
 import cv2
@@ -32,13 +33,106 @@ def format_srt_time(seconds):
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def build_prompt_tom():
+def load_description_csv(csv_path):
+    """Load description CSV file into pandas DataFrame"""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Description CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    required_cols = ['frame_index', 'timestamp_sec', 'description']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Description CSV missing required columns: {missing_cols}")
+
+    print(f"Loaded description CSV: {len(df)} frames")
+    return df
+
+def build_context_text(current_sample_idx, context_frames, description_df, tr, jump=0):
+    """
+    Build temporal context text from previous sampled frames with optional jump sampling
+    EXACT COPY from qwen3vl_tom_context_jump.py / gemma_tom_context.py
+
+    Args:
+        current_sample_idx: Index of current sample point (row number in description_df)
+        context_frames: Number of previous sampled frames to include (e.g., 5)
+        description_df: DataFrame with frame descriptions (already sampled at TR intervals)
+        tr: Repetition Time in seconds (e.g., 0.8 or 1.0)
+        jump: Jump/skip parameter for sampling (default: 0)
+              - jump=0: consecutive sampling (step=1)
+              - jump=1: skip 1 between samples (step=2)
+              - jump=2: skip 2 between samples (step=3)
+
+    Returns:
+        Formatted context string with clear instructions, or empty string if no context
+    """
+    if context_frames <= 0 or current_sample_idx == 0:
+        return ""
+
+    step = jump + 1
+
+    prev_indices = []
+    for i in range(1, context_frames + 1):
+        prev_idx = current_sample_idx - (i * step)
+        if prev_idx >= 0:
+            prev_indices.append(prev_idx)
+        else:
+            break
+
+    if len(prev_indices) == 0:
+        return ""
+
+    context_lines = []
+    context_lines.append("═" * 77)
+    context_lines.append("                         VIDEO STORY CONTEXT                            ")
+    context_lines.append("═" * 77)
+    context_lines.append("")
+    context_lines.append("You are watching a continuous video story. Below are descriptions of key")
+    context_lines.append("moments that happened BEFORE the current frame. These previous scenes provide")
+    context_lines.append("narrative context to help you understand the character's emotional journey")
+    context_lines.append("and current mental state.")
+    context_lines.append("")
+    context_lines.append("Use this story progression to inform your Theory of Mind rating.")
+    context_lines.append("")
+    context_lines.append("Previous Moments in the Story:")
+
+    for prev_idx in reversed(prev_indices):
+        if prev_idx < len(description_df):
+            row = description_df.iloc[prev_idx]
+            desc = row['description']
+            time_ago = (current_sample_idx - prev_idx) * tr
+            context_lines.append(f"• {time_ago:.1f} seconds ago: {desc}")
+        else:
+            time_ago = (current_sample_idx - prev_idx) * tr
+            context_lines.append(f"• {time_ago:.1f} seconds ago: [Description not available]")
+
+    context_lines.append("")
+    context_lines.append("─" * 77)
+    context_lines.append("")
+    context_lines.append("NOW → Current Frame (the image you see above):")
+    context_lines.append("Consider how the story has developed. Based on this progression,")
+    context_lines.append("rate the Theory of Mind for THIS current moment.")
+    context_lines.append("")
+    context_lines.append("═" * 77)
+    context_lines.append("")
+
+    return "\n".join(context_lines)
+
+def build_prompt_tom(context_text=""):
     """
     Theory of Mind Prompt - Focus on EMOTIONAL ENGAGEMENT and EMPATHY
     Based on: ability to understand and infer what others might be thinking/feeling
+
+    Args:
+        context_text: Optional temporal context from previous frames
     """
+    context_section = ""
+    if context_text:
+        context_section = context_text + "\n"
+
     return (
         "[Answer ONLY in English]\n\n"
+        + context_section +
         "═══════════════════════════════════════════════════════════════════════\n"
         "                    THEORY OF MIND (ToM) RATING TASK                   \n"
         "═══════════════════════════════════════════════════════════════════════\n\n"
@@ -290,51 +384,69 @@ def postprocess_tom(text):
     
     return rating, reasoning
 
-def extract_frames_per_second(video_path, fps_sample=1.0):
+def extract_frames_by_tr(video_path, tr=1.0):
+    """
+    Extract frames based on fMRI Repetition Time (TR)
+    EXACT COPY from video_analysis_valence_llada.py / qwen3vl / gemma versions
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
-    
+
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps
-    
-    print(f"Video info: FPS={fps:.2f}, Total frames={total_frames}, Duration={duration:.2f}s")
-    
+
+    print(f"Video info:")
+    print(f"  - Native FPS: {fps:.2f}")
+    print(f"  - Total frames: {total_frames}")
+    print(f"  - Duration: {duration:.2f}s")
+    print(f"  - fMRI TR: {tr}s")
+    print(f"  - Sampling rate: 1 frame every {tr}s")
+
     frames = []
-    frame_interval = int(fps / fps_sample)
+    current_time = 0.0
     frame_count = 0
-    
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
-        if frame_count % frame_interval == 0:
-            timestamp = frame_count / fps
+
+        current_video_time = frame_count / fps
+
+        if current_video_time >= current_time:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(rgb_frame)
-            frames.append((len(frames), timestamp, pil_image))
-        
+            frames.append((len(frames), current_time, pil_image))
+            current_time += tr
+
         frame_count += 1
-    
+
     cap.release()
-    print(f"Sampled {len(frames)} frames")
+    expected_frames = int(duration / tr) + 1
+    print(f"\nExtracted {len(frames)} frames (expected ~{expected_frames})")
     return frames
 
-def analyze_frame_tom(image, tokenizer, model, image_processor, device):
-    """Analyze frame for Theory of Mind"""
-    
+def analyze_frame_tom(image, tokenizer, model, image_processor, device, current_sample_idx=0,
+                     description_df=None, context_frames=0, tr=1.0, jump=0):
+    """Analyze frame for Theory of Mind with optional temporal context"""
+
+    context_text = ""
+    if context_frames > 0 and description_df is not None and current_sample_idx > 0:
+        context_text = build_context_text(current_sample_idx, context_frames,
+                                        description_df, tr, jump)
+
     print("    [1/5] Preprocessing...", end='', flush=True)
     t_start = time.time()
     image_tensor = process_images([image], image_processor, model.config)
     image_tensor = [img.to(dtype=torch.float16, device=device) for img in image_tensor]
     image_sizes = [image.size]
     print(f" Done ({time.time()-t_start:.2f}s)")
-    
+
     print("    [2/5] Building ToM prompt...", end='', flush=True)
     t_start = time.time()
-    question = DEFAULT_IMAGE_TOKEN + "\n" + build_prompt_tom()
+    question = DEFAULT_IMAGE_TOKEN + "\n" + build_prompt_tom(context_text)
     conv = copy.deepcopy(conv_templates["llava_llada"])
     conv.append_message(conv.roles[0], question)
     conv.append_message(conv.roles[1], None)
@@ -382,10 +494,19 @@ def main():
     parser.add_argument("--csv", required=True, help="Path to output CSV data file")
     parser.add_argument("--model-id", default="GSAI-ML/LLaDA-V")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--fps", type=float, default=1.0, help="Frames per second to sample")
+    parser.add_argument("--tr", type=float, default=1.0, help="fMRI TR in seconds (default: 1.0)")
+    parser.add_argument("--context-frames", type=int, default=0,
+                       help="Number of previous frames for temporal context (default: 0)")
+    parser.add_argument("--jump", type=int, default=0,
+                       help="Jump parameter for context sampling: 0=consecutive, 1=skip 1, 2=skip 2, etc.")
+    parser.add_argument("--description-csv",
+                       help="Path to description CSV file for temporal context")
     parser.add_argument("--test-first-n", type=int, default=None, help="Test with first N frames only")
     args = parser.parse_args()
-    
+
+    if args.context_frames > 0 and not args.description_csv:
+        parser.error("--context-frames requires --description-csv")
+
     device = args.device
     
     print("=" * 80)
@@ -418,12 +539,20 @@ def main():
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
     print("✓ Model loaded\n")
-    
+
+    description_df = None
+    if args.context_frames > 0:
+        print("=" * 80)
+        print("Loading description CSV for temporal context...")
+        print("=" * 80)
+        description_df = load_description_csv(args.description_csv)
+        print()
+
     print("=" * 80)
-    print("Step 2/4: Extracting frames...")
+    print("Step 2/4: Extracting frames by TR...")
     print("=" * 80)
-    frames = extract_frames_per_second(args.video, args.fps)
-    
+    frames = extract_frames_by_tr(args.video, args.tr)
+
     if args.test_first_n:
         frames = frames[:args.test_first_n]
         print(f"⚠️  Test mode: {len(frames)} frames only")
@@ -442,7 +571,12 @@ def main():
         
         t0 = time.time()
         rating, reasoning, raw = analyze_frame_tom(
-            image, tokenizer, model, image_processor, device
+            image, tokenizer, model, image_processor, device,
+            current_sample_idx=idx,
+            description_df=description_df,
+            context_frames=args.context_frames,
+            tr=args.tr,
+            jump=args.jump,
         )
         dt = time.time() - t0
         total_time += dt
@@ -478,7 +612,7 @@ def main():
     with open(args.srt, 'w', encoding='utf-8') as f:
         for i, r in enumerate(results, 1):
             t1 = r['timestamp']
-            t2 = results[i]['timestamp'] if i < len(results) else t1 + 1.0
+            t2 = results[i]['timestamp'] if i < len(results) else t1 + args.tr
             rating_str = f"+{r['tom_rating']}" if r['tom_rating'] > 0 else str(r['tom_rating'])
             f.write(f"{i}\n")
             f.write(f"{format_srt_time(t1)} --> {format_srt_time(t2)}\n")
